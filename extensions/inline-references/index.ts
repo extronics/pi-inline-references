@@ -1,74 +1,74 @@
 /**
- * Inline Reference Resolver
+ * Inline References
  *
- * A pi extension that resolves inline `@path` references in markdown files.
- * When a markdown file is read via the `read` tool, any `@some/file.md`
- * references are replaced with markdown link anchors and the referenced
- * file's content is appended below.
+ * When the `read` tool reads a Markdown file, this extension adds the files that the file
+ * references with `@path.md` to the result, in a `<referenced-files>` block after the file text.
+ * The file text itself does not change, so the model can use it for `edit` calls.
  *
- * Configuration:
- *   - MAX_DEPTH: Maximum recursion depth for nested references (default: 3)
+ * - References resolve relative to the file that contains them, to a depth of 3.
+ * - Only files inside the project (the working directory) are included.
+ * - The included files of one read share the size limit of the read tool.
+ * - Files that the model context has already (included or read completely before, on the
+ *   current branch) are only named, not included again.
  *
- * Example:
- *   Input file content:  "See @docs/details.md for more."
- *   Output: "See [docs/details.md](#reference-a1b2c3d4e5f6) for more.
- *
- *   <!-- inline reference injected from docs/details.md -->
- *   #### reference-a1b2c3d4e5f6
- *   <content of docs/details.md>"
+ * See README.md for the details.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import * as path from "node:path";
-import { REF_PATTERN, resolveContent } from "./resolve.ts";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES } from "@earendil-works/pi-coding-agent";
+import { completelyReadFile, filesInMessages } from "./context.ts";
+import { realPath, resolveReadPath } from "./paths.ts";
+import { collectReferencedFiles, formatReferencedFiles } from "./resolve.ts";
 
-// -----------------------------------------------------------------------------
-// Entry Point
-// -----------------------------------------------------------------------------
+/** Levels of references to follow. */
+export const MAX_DEPTH = 3;
 
-export default function (pi: ExtensionAPI) {
+/** The continuation notice that the read tool adds to the end of a partial result. */
+const READ_NOTICE = /\n\n\[(?:Showing lines \d+-\d+ of \d+|\d+ more lines in file\.)[^\]\n]*\]$/;
+
+export default function inlineReferences(pi: ExtensionAPI) {
+	/** Project-relative paths of the files in the model context of the current branch. */
+	let inContext = new Set<string>();
+
+	function syncWithContext(ctx: ExtensionContext) {
+		const projectRoot = realPath(ctx.cwd) ?? ctx.cwd;
+		inContext = filesInMessages(ctx.sessionManager.buildSessionProjection().messages, ctx.cwd, projectRoot);
+	}
+
+	pi.on("session_start", async (_event, ctx) => syncWithContext(ctx));
+	pi.on("session_tree", async (_event, ctx) => syncWithContext(ctx));
+	pi.on("session_compact", async (_event, ctx) => syncWithContext(ctx));
+
 	pi.on("tool_result", async (event, ctx) => {
-		// Only process read tool results for markdown files.
-		if (event.toolName !== "read") {
-			return;
-		}
+		// Results of nested calls (e.g. from a codemode script) go to the calling tool, not to the agent.
+		if (event.toolName !== "read" || event.isError || event.parentToolCallId) return;
+		const input = event.input as { path?: unknown; offset?: unknown; limit?: unknown };
+		if (typeof input.path !== "string") return;
 
-		const filePath = event.input.path as string | undefined;
-		if (!filePath || !filePath.endsWith(".md")) {
-			return;
-		}
+		const projectRoot = realPath(ctx.cwd) ?? ctx.cwd;
+		const readFile = completelyReadFile(input, event.details, ctx.cwd, projectRoot);
+		const [first, ...rest] = event.content;
+		const isMarkdown = input.path.endsWith(".md") && first?.type === "text";
 
-		// Extract text content from the tool result.
-		const textParts = event.content
-			.filter((c): c is { type: "text"; text: string } => c.type === "text")
-			.map((c) => c.text);
+		const files = isMarkdown
+			? collectReferencedFiles(resolveReadPath(input.path, ctx.cwd), first.text.replace(READ_NOTICE, ""), {
+					projectRoot,
+					maxDepth: MAX_DEPTH,
+					maxBytes: DEFAULT_MAX_BYTES,
+					maxLines: DEFAULT_MAX_LINES,
+					inContext,
+				})
+			: [];
+		if (readFile) inContext.add(readFile);
+		for (const file of files) if (file.status === "included") inContext.add(file.path);
+		if (files.length === 0 || first?.type !== "text") return;
 
-		if (textParts.length === 0) {
-			return;
-		}
-
-		const originalContent = textParts.join("");
-
-		// Quick exit if no @ references present.
-		if (!REF_PATTERN.test(originalContent)) {
-			return;
-		}
-
-		// Resolve inline references.
-		const baseDir = path.dirname(path.resolve(ctx.cwd, filePath));
-		const resolved = await resolveContent(
-			originalContent,
-			baseDir,
-			0,
-			new Set(),
-		);
-
-		if (resolved === originalContent) {
-			return;
-		}
-
+		// Keep the continuation notice of the read tool at the end, where the model expects it.
+		const notice = READ_NOTICE.exec(first.text)?.[0] ?? "";
+		const text = first.text.slice(0, first.text.length - notice.length);
 		return {
-			content: [{ type: "text", text: resolved }],
+			content: [{ ...first, text: `${text}${text.endsWith("\n") ? "\n" : "\n\n"}${formatReferencedFiles(files)}${notice}` }, ...rest],
+			structuredContent: event.structuredContent,
 		};
 	});
 }
